@@ -61,6 +61,22 @@ TEMPERATURE = 0.1
 PROMPT_1 = "In one short sentence, what is the capital of France?"
 PROMPT_2 = "In one short sentence, name its most famous landmark."
 
+# Single-turn models reject conversation history, so their cache reuse
+# is a pinned system prefix shared by successive one-shot requests.
+SINGLE_TURN_SYSTEM = (
+    "You are a terse assistant. Answer in one short sentence. "
+    "Never elaborate. Stay factual."
+)
+SINGLE_TURN_PROMPT_1 = "What is the capital of France?"
+SINGLE_TURN_PROMPT_2 = "What is the capital of Japan?"
+
+# Substring of the server's rejection when history is not allowed.
+SINGLE_TURN_MARKER = b"only supports single-turn requests"
+
+
+class SingleTurnModel(Exception):
+    """The model under test rejects multi-turn conversation history."""
+
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for this integration test."""
@@ -117,6 +133,14 @@ def build_turn2_messages(
     return messages
 
 
+def build_single_turn_messages(prompt: str) -> list[dict[str, str]]:
+    """Build a one-shot exchange sharing the pinned system prefix."""
+    return [
+        {"role": "system", "content": SINGLE_TURN_SYSTEM},
+        {"role": "user", "content": prompt},
+    ]
+
+
 def post_json(
     url: str,
     payload: dict[str, Any],
@@ -143,14 +167,22 @@ def post_json(
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read()
+            body = response.read()
     except urllib.error.HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
+        raw = error.read()
+        if SINGLE_TURN_MARKER in raw:
+            raise SingleTurnModel(raw.decode("utf-8", errors="replace"))
+        text = raw.decode("utf-8", errors="replace")
         raise AssertionError(
-            f"POST {url} failed with HTTP {error.code}: {body}"
+            f"POST {url} failed with HTTP {error.code}: {text}"
         ) from error
     except urllib.error.URLError as error:
         raise AssertionError(f"POST {url} failed: {error.reason}") from error
+    # The server answers 200 with an error body in some builds, so the
+    # marker has to be checked on the success path too.
+    if SINGLE_TURN_MARKER in body:
+        raise SingleTurnModel(body.decode("utf-8", errors="replace"))
+    return body
 
 
 def extract_message_and_usage(
@@ -299,11 +331,22 @@ def assert_cache_growth(
             f"({turn1_prompt_tokens}); the KV cache prefix reuse bug "
             "would make usage collapse instead of grow"
         )
-    details = turn2_usage.get("prompt_tokens_details")
+    assert_prefix_reused(turn2_usage, turn_label)
+
+
+def assert_prefix_reused(usage: dict[str, Any], turn_label: str) -> None:
+    """Assert a cached prefix was reused and counted in the prompt.
+
+    ``prompt_tokens_details.cached_tokens`` must be a positive integer
+    no larger than ``prompt_tokens``: the cached prefix is reported as
+    a subset of the whole prompt, never instead of it.
+    """
+    prompt_tokens = usage.get("prompt_tokens")
+    details = usage.get("prompt_tokens_details")
     if not isinstance(details, dict) or "cached_tokens" not in details:
         raise AssertionError(
-            f"{turn_label}: turn 2 usage is missing "
-            f"prompt_tokens_details.cached_tokens: {turn2_usage!r}"
+            f"{turn_label}: usage is missing "
+            f"prompt_tokens_details.cached_tokens: {usage!r}"
         )
     cached_tokens = details["cached_tokens"]
     if not isinstance(cached_tokens, int) or isinstance(cached_tokens, bool):
@@ -313,15 +356,55 @@ def assert_cache_growth(
         )
     if cached_tokens <= 0:
         raise AssertionError(
-            f"{turn_label}: expected turn 2 cached_tokens > 0, "
-            f"got {cached_tokens}"
+            f"{turn_label}: expected cached_tokens > 0, got {cached_tokens}"
         )
-    if cached_tokens > turn2_prompt_tokens:
+    if cached_tokens > prompt_tokens:
         raise AssertionError(
             f"{turn_label}: cached_tokens ({cached_tokens}) exceeds "
-            f"prompt_tokens ({turn2_prompt_tokens}); cached_tokens "
-            "must be a subset of prompt_tokens"
+            f"prompt_tokens ({prompt_tokens}); cached_tokens must be a "
+            "subset of prompt_tokens"
         )
+
+
+def run_pinned_prefix_checks(
+    url: str,
+    model: str,
+    timeout: float,
+    stream: bool,
+    label: str,
+) -> None:
+    """Check cache accounting on a single-turn model.
+
+    Single-turn models reject conversation history, so the growing
+    transcript used elsewhere does not apply. Their cache reuse is the
+    pinned system prefix shared by successive one-shot requests: two
+    requests share one system message, and the second must report that
+    prefix as reused and counted inside ``prompt_tokens``.
+    """
+    prompts = (SINGLE_TURN_PROMPT_1, SINGLE_TURN_PROMPT_2)
+    suffix = " (stream)" if stream else ""
+    usages = []
+    for index, prompt in enumerate(prompts, start=1):
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": build_single_turn_messages(prompt),
+            "temperature": TEMPERATURE,
+            "max_tokens": MAX_TOKENS,
+        }
+        if stream:
+            payload["stream"] = True
+        body = post_json(url, payload, timeout)
+        if stream:
+            _, usage = extract_streamed_reply_and_usage(parse_sse_chunks(body))
+        else:
+            _, usage = extract_message_and_usage(json.loads(body))
+        print_usage(f"request {index}{suffix}", usage)
+        assert_usage_consistency(usage, f"{label} request {index}")
+        usages.append(usage)
+    # Only the second request is required to show a reused prefix: the
+    # first may or may not already sit on the pin, depending on whether
+    # the model was just loaded.
+    assert_prefix_reused(usages[1], f"{label} request 2")
 
 
 def run_non_streaming_test(endpoint: str, model: str, timeout: float) -> None:
@@ -346,7 +429,22 @@ def run_non_streaming_test(endpoint: str, model: str, timeout: float) -> None:
     turn2_messages = build_turn2_messages(turn1_messages, turn1_reply)
     turn2_payload = copy.deepcopy(turn1_payload)
     turn2_payload["messages"] = turn2_messages
-    turn2_body = post_json(url, turn2_payload, timeout)
+    try:
+        turn2_body = post_json(url, turn2_payload, timeout)
+    except SingleTurnModel:
+        print(
+            "  model rejects multi-turn history; checking the pinned "
+            "system prefix instead"
+        )
+        run_pinned_prefix_checks(
+            url,
+            model,
+            timeout,
+            stream=False,
+            label="test 1",
+        )
+        print("Test 1 PASSED")
+        return
     turn2_response = json.loads(turn2_body)
     _, turn2_usage = extract_message_and_usage(turn2_response)
     print_usage("turn 2", turn2_usage)
@@ -383,7 +481,22 @@ def run_streaming_test(endpoint: str, model: str, timeout: float) -> None:
     turn2_messages = build_turn2_messages(turn1_messages, turn1_reply)
     turn2_payload = copy.deepcopy(turn1_payload)
     turn2_payload["messages"] = turn2_messages
-    turn2_body = post_json(url, turn2_payload, timeout)
+    try:
+        turn2_body = post_json(url, turn2_payload, timeout)
+    except SingleTurnModel:
+        print(
+            "  model rejects multi-turn history; checking the pinned "
+            "system prefix instead"
+        )
+        run_pinned_prefix_checks(
+            url,
+            model,
+            timeout,
+            stream=True,
+            label="test 2",
+        )
+        print("Test 2 PASSED")
+        return
     turn2_chunks = parse_sse_chunks(turn2_body)
     _, turn2_usage = extract_streamed_reply_and_usage(turn2_chunks)
     print_usage("turn 2 (stream)", turn2_usage)
