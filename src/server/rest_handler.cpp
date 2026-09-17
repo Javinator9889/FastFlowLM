@@ -542,6 +542,36 @@ json RestHandler::build_nstream_response(std::string response_text, chat_meta_in
     bool is_reasoning = !result.reasoning_content.empty();
     bool is_tool_call = !result.tool_calls_list.empty() || !result.tool_name.empty();
 
+    // Only some models split the think block in parse_nstream_content (gpt-oss,
+    // nanbeige, ...). The rest leave it inline, and it then reaches the client
+    // as literal <think> tags in content instead of reasoning_content -- which
+    // is what a buffered stream shows, since the split otherwise only happens
+    // in the streaming parser. Do it here so every model reports reasoning the
+    // same way. No-op when the model already populated reasoning_content.
+    if (!is_reasoning) {
+        static const std::string think_open = "<think>";
+        static const std::string think_close = "</think>";
+        const size_t close_pos = result.content.find(think_close);
+        if (close_pos != std::string::npos) {
+            // The generation prompt may already have opened the block, in which
+            // case only the closing tag appears in the generated text.
+            size_t begin = 0;
+            const size_t open_pos = result.content.find(think_open);
+            if (open_pos != std::string::npos && open_pos < close_pos) {
+                begin = open_pos + think_open.length();
+            }
+            auto trim = [](std::string v) {
+                const char* ws = " \t\r\n";
+                const size_t b = v.find_first_not_of(ws);
+                if (b == std::string::npos) return std::string();
+                return v.substr(b, v.find_last_not_of(ws) - b + 1);
+            };
+            result.reasoning_content = trim(result.content.substr(begin, close_pos - begin));
+            result.content = trim(result.content.substr(close_pos + think_close.length()));
+            is_reasoning = !result.reasoning_content.empty();
+        }
+    }
+
     if (is_reasoning) {
         message["reasoning_content"] = result.reasoning_content;
     }
