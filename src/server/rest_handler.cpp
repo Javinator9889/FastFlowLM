@@ -552,7 +552,22 @@ json RestHandler::build_nstream_response(std::string response_text, chat_meta_in
         static const std::string think_open = "<think>";
         static const std::string think_close = "</think>";
         const size_t close_pos = result.content.find(think_close);
-        if (close_pos != std::string::npos) {
+        const size_t open_only = result.content.find(think_open);
+        if (close_pos == std::string::npos && open_only != std::string::npos) {
+            // Generation was cut off inside the think block (finish_reason
+            // "length"), so the closing tag never arrived. Without this the
+            // partial thought is delivered as the answer, and the client shows
+            // "Thinking Process: 1. Analyze the Request: The user wants ...",
+            // which reads like the prompt being echoed back. Report it as
+            // reasoning and leave the answer empty, because there isn't one.
+            size_t b = result.content.find_first_not_of(
+                " \t\r\n", open_only + think_open.length());
+            result.reasoning_content = (b == std::string::npos)
+                ? std::string() : result.content.substr(b);
+            result.content.clear();
+            is_reasoning = !result.reasoning_content.empty();
+        }
+        else if (close_pos != std::string::npos) {
             // The generation prompt may already have opened the block, in which
             // case only the closing tag appears in the generated text.
             size_t begin = 0;
